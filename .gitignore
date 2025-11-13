@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# environment & secrets
+.env
+.env.*
+
+# runtime artifacts
+*.log
+npm-debug.log*
+
+# OS metadata
+.DS_Store
