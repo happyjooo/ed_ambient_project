@@ -118,7 +118,7 @@ app.post("/analyze", async (req, res) => {
 
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4o",
       temperature: 0.3,
       response_format: { type: "json_object" },
       messages: [
