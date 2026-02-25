@@ -135,24 +135,22 @@ app.post("/analyze", async (req, res) => {
   }
 })
 
-const HEARTBEAT_INTERVAL = 30_000
-
 wss.on("connection", (clientWs) => {
   console.log("Client connected")
 
-  clientWs.isAlive = true
-  clientWs.on("pong", () => { clientWs.isAlive = true })
-
-  const heartbeat = setInterval(() => {
-    if (!clientWs.isAlive) {
-      clearInterval(heartbeat)
-      return clientWs.terminate()
-    }
-    clientWs.isAlive = false
-    clientWs.ping()
-  }, HEARTBEAT_INTERVAL)
-
-  let dgSocket = null
+  let dgSocket
+  try {
+    dgSocket = deepgram.listen.live({
+      model: "nova-3-medical",
+      diarize: true,
+      utterances: true,
+      smart_format: true,
+    })
+  } catch (err) {
+    console.error("Unable to initialize Deepgram connection", err)
+    clientWs.close(1011, "Deepgram connection failed")
+    return
+  }
 
   const forward = (payload) => {
     if (clientWs.readyState === WebSocket.OPEN) {
@@ -164,41 +162,19 @@ wss.on("connection", (clientWs) => {
     }
   }
 
-  function openDeepgram() {
-    if (dgSocket) return dgSocket
-    try {
-      dgSocket = deepgram.listen.live({
-        model: "nova-3-medical",
-        diarize: true,
-        utterances: true,
-        smart_format: true,
-      })
-    } catch (err) {
-      console.error("Unable to initialize Deepgram connection", err)
-      clientWs.close(1011, "Deepgram connection failed")
-      return null
-    }
-
-    dgSocket.on(LiveTranscriptionEvents.Open, () => console.log("Connected to Deepgram"))
-    dgSocket.on(LiveTranscriptionEvents.Close, () => {
-      console.log("Deepgram socket closed")
-      dgSocket = null
-    })
-    dgSocket.on(LiveTranscriptionEvents.Error, (err) => console.error("Deepgram socket error", err))
-    dgSocket.on(LiveTranscriptionEvents.Transcript, forward)
-    dgSocket.on(LiveTranscriptionEvents.Metadata, forward)
-    dgSocket.on(LiveTranscriptionEvents.Unhandled, forward)
-
-    return dgSocket
-  }
+  dgSocket.on(LiveTranscriptionEvents.Open, () => console.log("Connected to Deepgram"))
+  dgSocket.on(LiveTranscriptionEvents.Close, () => console.log("Deepgram socket closed"))
+  dgSocket.on(LiveTranscriptionEvents.Error, (err) => console.error("Deepgram socket error", err))
+  dgSocket.on(LiveTranscriptionEvents.Transcript, forward)
+  dgSocket.on(LiveTranscriptionEvents.Metadata, forward)
+  dgSocket.on(LiveTranscriptionEvents.Unhandled, forward)
 
   clientWs.on("message", (message, isBinary) => {
     if (!isBinary) {
       try {
         const data = JSON.parse(message.toString())
-        if (data?.type === "ping") return
         if (data?.type === "control") {
-          dgSocket?.send(JSON.stringify(data))
+          dgSocket.send(JSON.stringify(data))
         }
       } catch {
         // ignore non-JSON text
@@ -206,8 +182,7 @@ wss.on("connection", (clientWs) => {
       return
     }
 
-    const dg = openDeepgram()
-    if (dg) dg.send(message)
+    dgSocket.send(message)
   })
 
   const cleanup = () => {
@@ -224,13 +199,11 @@ wss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     console.log("Client disconnected")
-    clearInterval(heartbeat)
     cleanup()
   })
 
   clientWs.on("error", (err) => {
     console.error("Client WS error", err)
-    clearInterval(heartbeat)
     cleanup()
   })
 })
