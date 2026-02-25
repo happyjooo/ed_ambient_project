@@ -95,12 +95,20 @@
     state.ws = ws
     ws.binaryType = "arraybuffer"
 
+    let keepAlive = null
+
     ws.addEventListener("open", () => {
       state.connected = true
       updateControls()
+      keepAlive = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }))
+        }
+      }, 25000)
     })
 
     ws.addEventListener("close", () => {
+      clearInterval(keepAlive)
       state.connected = false
       updateControls()
       if (state.listening) {
