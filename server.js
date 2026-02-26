@@ -40,13 +40,28 @@ You must generate your response in a clear, organized Markdown format, strictly 
 ED Consultation Analysis: [Patient's Chief Complaint]
 1. History Analysis & Recommended Physical Examination
 Analysis of History Taking:
-Begin by briefly commenting on the quality of the history.
-Then, only if critical, high-yield information appears to be missing, list further essential questions. If the history was thorough and comprehensive for the presenting complaint, you should state this explicitly (e.g., "The history was well-focused and comprehensive."). Do not invent trivial or low-yield questions.
-Example of when to add a question:
-Further Question Suggested: [e.g., "In the context of this chest pain, have you had any recent long-distance travel or periods of immobility?"]
-Rationale: [e.g., "This question was not asked and is crucial for assessing the risk of venous thromboembolism (VTE)."]
-Example of acknowledging good history:
-"The history effectively explored the cardinal features of the chest pain, including onset, duration, character, and associated symptoms. No immediate, critical questions appear to have been missed."
+Evaluate the history systematically against the mandatory domains below. For each domain, explicitly state whether it was covered or missed in the transcript.
+
+A. Presenting Complaint Characterisation (WWQQAA):
+  - Where: Location and radiation
+  - When: Onset, timing, duration, progression
+  - Quality: Character of the symptom (e.g. sharp, dull, burning, colicky)
+  - Quantity: Severity or intensity (e.g. pain score out of 10)
+  - Aggravating factors: What makes it worse
+  - Alleviating factors: What relieves it
+
+B. Past Medical History (PMHx): Previous illnesses, surgeries, hospitalisations
+C. Medication History (DHx): Current medications, allergies (including drug allergies), recent changes
+D. Family History (FHx): Relevant familial conditions (e.g. cardiac disease, cancer, diabetes)
+E. Social History (SHx): Smoking, alcohol, recreational drugs, occupation, living situation, functional baseline
+
+For every domain NOT covered in the transcript, you MUST flag it as a gap and suggest the specific questions the clinician should ask. Do NOT describe the history as "comprehensive" or "well-focused" if any of these core domains were not explored. Only acknowledge completeness for domains that were genuinely addressed.
+Example of flagging a missing domain:
+Domain Gap: "Medication History (DHx) was not explored."
+Further Question Suggested: "What medications are you currently taking? Do you have any allergies to medications?"
+Rationale: "Medication history is essential as current medications may interact with treatment and allergies must be known before prescribing."
+Example of acknowledging good coverage:
+"The presenting complaint was well-characterised — location, onset, character, severity, and aggravating/alleviating factors were all addressed. PMHx was explored. However, DHx, FHx, and SHx were not discussed and must be obtained."
 Recommended Physical Examination:
 Based on the history provided in the transcript, recommend the most important and focused physical examination steps to perform next.
 Examination Step: [e.g., "Perform a full cardiovascular and respiratory examination."]
@@ -135,22 +150,26 @@ app.post("/analyze", async (req, res) => {
   }
 })
 
+const HEARTBEAT_MS = 30_000
+
 wss.on("connection", (clientWs) => {
   console.log("Client connected")
 
-  let dgSocket
-  try {
-    dgSocket = deepgram.listen.live({
-      model: "nova-3-medical",
-      diarize: true,
-      utterances: true,
-      smart_format: true,
-    })
-  } catch (err) {
-    console.error("Unable to initialize Deepgram connection", err)
-    clientWs.close(1011, "Deepgram connection failed")
-    return
-  }
+  clientWs.isAlive = true
+  clientWs.on("pong", () => { clientWs.isAlive = true })
+
+  const heartbeat = setInterval(() => {
+    if (!clientWs.isAlive) {
+      clearInterval(heartbeat)
+      return clientWs.terminate()
+    }
+    clientWs.isAlive = false
+    clientWs.ping()
+  }, HEARTBEAT_MS)
+
+  let dgSocket = null
+  let dgReady = false
+  let audioBuffer = []
 
   const forward = (payload) => {
     if (clientWs.readyState === WebSocket.OPEN) {
@@ -162,30 +181,46 @@ wss.on("connection", (clientWs) => {
     }
   }
 
-  dgSocket.on(LiveTranscriptionEvents.Open, () => console.log("Connected to Deepgram"))
-  dgSocket.on(LiveTranscriptionEvents.Close, () => console.log("Deepgram socket closed"))
-  dgSocket.on(LiveTranscriptionEvents.Error, (err) => console.error("Deepgram socket error", err))
-  dgSocket.on(LiveTranscriptionEvents.Transcript, forward)
-  dgSocket.on(LiveTranscriptionEvents.Metadata, forward)
-  dgSocket.on(LiveTranscriptionEvents.Unhandled, forward)
-
-  clientWs.on("message", (message, isBinary) => {
-    if (!isBinary) {
-      try {
-        const data = JSON.parse(message.toString())
-        if (data?.type === "control") {
-          dgSocket.send(JSON.stringify(data))
-        }
-      } catch {
-        // ignore non-JSON text
-      }
+  function openDeepgram() {
+    closeDeepgram()
+    try {
+      dgSocket = deepgram.listen.live({
+        model: "nova-3-medical",
+        diarize: true,
+        utterances: true,
+        smart_format: true,
+      })
+    } catch (err) {
+      console.error("Unable to initialize Deepgram connection", err)
+      forward({ type: "error", message: "Deepgram connection failed" })
       return
     }
 
-    dgSocket.send(message)
-  })
+    dgSocket.on(LiveTranscriptionEvents.Open, () => {
+      console.log("Connected to Deepgram")
+      dgReady = true
+      for (const chunk of audioBuffer) {
+        dgSocket.send(chunk)
+      }
+      audioBuffer = []
+      forward({ type: "session_ready" })
+    })
 
-  const cleanup = () => {
+    dgSocket.on(LiveTranscriptionEvents.Close, () => {
+      console.log("Deepgram socket closed")
+      dgReady = false
+      dgSocket = null
+    })
+
+    dgSocket.on(LiveTranscriptionEvents.Error, (err) => console.error("Deepgram socket error", err))
+    dgSocket.on(LiveTranscriptionEvents.Transcript, forward)
+    dgSocket.on(LiveTranscriptionEvents.Metadata, forward)
+    dgSocket.on(LiveTranscriptionEvents.Unhandled, forward)
+  }
+
+  function closeDeepgram() {
+    dgReady = false
+    audioBuffer = []
     if (dgSocket) {
       try {
         dgSocket.requestClose?.()
@@ -197,14 +232,44 @@ wss.on("connection", (clientWs) => {
     }
   }
 
+  clientWs.on("message", (message, isBinary) => {
+    if (!isBinary) {
+      try {
+        const data = JSON.parse(message.toString())
+        if (data?.type === "start_session") {
+          openDeepgram()
+          return
+        }
+        if (data?.type === "stop_session") {
+          closeDeepgram()
+          return
+        }
+        if (data?.type === "control") {
+          dgSocket?.send(JSON.stringify(data))
+        }
+      } catch {
+        // ignore non-JSON text
+      }
+      return
+    }
+
+    if (dgReady && dgSocket) {
+      dgSocket.send(message)
+    } else if (dgSocket) {
+      audioBuffer.push(message)
+    }
+  })
+
   clientWs.on("close", () => {
     console.log("Client disconnected")
-    cleanup()
+    clearInterval(heartbeat)
+    closeDeepgram()
   })
 
   clientWs.on("error", (err) => {
     console.error("Client WS error", err)
-    cleanup()
+    clearInterval(heartbeat)
+    closeDeepgram()
   })
 })
 

@@ -117,6 +117,13 @@
     ws.addEventListener("message", (event) => {
       try {
         const payload = JSON.parse(event.data)
+        if (payload?.type === "session_ready") {
+          return
+        }
+        if (payload?.type === "error") {
+          console.error("Server error:", payload.message)
+          return
+        }
         if (payload?.channel?.alternatives) {
           processTranscriptPayload(payload)
         }
@@ -139,6 +146,8 @@
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       state.audioStream = stream
+
+      state.ws.send(JSON.stringify({ type: "start_session" }))
 
       const options = {}
       if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
@@ -181,6 +190,9 @@
     }
     if (state.audioStream) {
       state.audioStream.getTracks().forEach((track) => track.stop())
+    }
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: "stop_session" }))
     }
     state.mediaRecorder = null
     state.audioStream = null
