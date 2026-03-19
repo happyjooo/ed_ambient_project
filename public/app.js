@@ -11,6 +11,8 @@
     mediaRecorder: null,
     audioStream: null,
     docAssistStatus: "idle",
+    docAssistReasoning: null,
+    showReasoning: false,
   }
 
   const ui = {}
@@ -53,12 +55,19 @@
             </section>
 
             <section class="rounded-2xl bg-white/95 p-6 shadow-lg border border-slate-100 flex flex-col overflow-hidden" style="height:70vh">
-              <div class="flex items-baseline justify-between mb-4">
+              <div class="flex items-center justify-between mb-4">
                 <div>
                   <p class="text-xs uppercase tracking-[0.3em] text-slate-400 font-mono">AI Review</p>
-                  <h2 class="text-2xl font-semibold text-slate-900">DocAssist Suggestions</h2>
+                  <h2 class="text-2xl font-semibold text-slate-900">DocAssist</h2>
                 </div>
-                <span data-ref="docAssistStatus" class="text-xs font-semibold uppercase tracking-wide text-slate-400">Awaiting transcript</span>
+                <div class="flex items-center gap-2">
+                  <button data-ref="reasoningBtn" class="hidden px-3 py-1 rounded-lg text-xs font-semibold bg-slate-100 text-slate-600 hover:bg-slate-200 transition">
+                    Show Reasoning
+                  </button>
+                  <span data-ref="docAssistStatus" class="text-xs font-semibold uppercase tracking-wide text-slate-400">Awaiting transcript</span>
+                </div>
+              </div>
+              <div data-ref="reasoningPanel" class="hidden mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 overflow-y-auto text-xs font-mono text-slate-600 leading-relaxed" style="max-height:40%;min-height:0">
               </div>
               <div data-ref="docAssistContent" class="flex-1 overflow-y-auto scrollbar-thin pr-1" style="min-height:0">
               </div>
@@ -74,6 +83,8 @@
     ui.transcriptList = root.querySelector('[data-ref="transcriptList"]')
     ui.docAssistContent = root.querySelector('[data-ref="docAssistContent"]')
     ui.docAssistStatus = root.querySelector('[data-ref="docAssistStatus"]')
+    ui.reasoningBtn = root.querySelector('[data-ref="reasoningBtn"]')
+    ui.reasoningPanel = root.querySelector('[data-ref="reasoningPanel"]')
 
     renderEmptyTranscript()
     setDocAssistState("idle", "Stop a session to generate structured feedback for the encounter.")
@@ -83,6 +94,18 @@
   function bindEvents() {
     ui.startBtn.addEventListener("click", startSession)
     ui.stopBtn.addEventListener("click", stopSession)
+    ui.reasoningBtn.addEventListener("click", toggleReasoning)
+  }
+
+  function toggleReasoning() {
+    state.showReasoning = !state.showReasoning
+    ui.reasoningBtn.textContent = state.showReasoning ? "Hide Reasoning" : "Show Reasoning"
+    if (state.showReasoning) {
+      ui.reasoningPanel.innerHTML = `<p class="whitespace-pre-wrap">${escapeHtml(state.docAssistReasoning || "")}</p>`
+      ui.reasoningPanel.classList.remove("hidden")
+    } else {
+      ui.reasoningPanel.classList.add("hidden")
+    }
   }
 
   function connectSocket() {
@@ -285,7 +308,7 @@
     ui.transcriptList.innerHTML = `
       <div class="rounded-2xl border border-dashed border-slate-200 p-8 text-center text-slate-400">
         <p class="text-lg font-semibold text-slate-500">Awaiting conversation</p>
-        <p class="text-sm mt-1">Press “Start Listening” to capture the dialogue.</p>
+        <p class="text-sm mt-1">Press "Start Listening" to capture the dialogue.</p>
       </div>
     `
   }
@@ -366,32 +389,69 @@
     }
 
     setDocAssistState("loading")
+
+    let accContent = ""
+    let accReasoning = ""
+
     try {
       const response = await fetch("/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript }),
       })
+
       if (!response.ok) {
         const error = await response.json().catch(() => ({}))
         throw new Error(error.error || "DocAssist unavailable")
       }
-      const payload = await response.json()
-      if (!payload?.content) {
-        throw new Error("Invalid response")
-      }
 
-      let parsed = null
-      try {
-        parsed = JSON.parse(payload.content)
-      } catch {
-        parsed = null
-      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
 
-      if (parsed && typeof parsed === "object") {
-        setDocAssistState("structured", parsed)
-      } else {
-        setDocAssistState("markdown", payload.content)
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+
+        const chunks = buffer.split("\n\n")
+        buffer = chunks.pop()
+
+        for (const chunk of chunks) {
+          const line = chunk.trim()
+          if (!line.startsWith("data: ")) continue
+
+          let event
+          try {
+            event = JSON.parse(line.slice(6))
+          } catch {
+            continue
+          }
+
+          if (event.type === "thinking") {
+            accReasoning += event.text
+            ui.docAssistStatus.textContent = "Thinking…"
+          } else if (event.type === "text") {
+            accContent += event.text
+            ui.docAssistStatus.textContent = "Generating…"
+          } else if (event.type === "done") {
+            state.docAssistReasoning = accReasoning || null
+            let parsed = null
+            try {
+              parsed = JSON.parse(accContent)
+            } catch {
+              parsed = null
+            }
+            if (parsed && typeof parsed === "object") {
+              setDocAssistState("structured", parsed)
+            } else {
+              setDocAssistState("markdown", accContent)
+            }
+          } else if (event.type === "error") {
+            throw new Error(event.message || "analysis_failed")
+          }
+        }
       }
     } catch (err) {
       console.error("DocAssist error", err)
@@ -401,27 +461,44 @@
 
   function setDocAssistState(status, data) {
     state.docAssistStatus = status
+
+    // Reset reasoning toggle
+    state.showReasoning = false
+    ui.reasoningPanel.classList.add("hidden")
+    ui.reasoningPanel.innerHTML = ""
+
     switch (status) {
       case "idle":
         ui.docAssistStatus.textContent = "Awaiting transcript"
         ui.docAssistContent.innerHTML = docAssistPlaceholder(data)
+        ui.reasoningBtn.classList.add("hidden")
         break
       case "loading":
         ui.docAssistStatus.textContent = "Analyzing…"
         ui.docAssistContent.innerHTML = loadingBlock()
+        ui.reasoningBtn.classList.add("hidden")
         break
       case "structured":
         ui.docAssistStatus.textContent = "AI summary ready"
         ui.docAssistContent.innerHTML = docAssistStructured(data)
+        if (state.docAssistReasoning) {
+          ui.reasoningBtn.textContent = "Show Reasoning"
+          ui.reasoningBtn.classList.remove("hidden")
+        }
         break
       case "markdown":
         ui.docAssistStatus.textContent = "AI summary (markdown)"
         ui.docAssistContent.innerHTML = docAssistMarkdown(data)
+        if (state.docAssistReasoning) {
+          ui.reasoningBtn.textContent = "Show Reasoning"
+          ui.reasoningBtn.classList.remove("hidden")
+        }
         break
       case "error":
       default:
         ui.docAssistStatus.textContent = "Analysis unavailable"
         ui.docAssistContent.innerHTML = errorBlock(data)
+        ui.reasoningBtn.classList.add("hidden")
         break
     }
   }
@@ -465,15 +542,74 @@
   function docAssistStructured(data) {
     return `
       <div class="space-y-6 text-slate-900">
-            ${chiefComplaintBlock(data.chief_complaint)}
-            ${historyBlock(data.history)}
-            ${differentialBlock(data.differentials)}
-            ${investigationBlock(data.investigations)}
-            ${redFlagsBlock(data.red_flags)}
-            ${disclaimerBlock(data.disclaimer)}
+        ${safetyFlagsBlock(data.safety_flags)}
+        ${priorityActionsBlock(data.priority_actions)}
+        ${chiefComplaintBlock(data.chief_complaint)}
+        ${historyBlock(data.history)}
+        ${differentialBlock(data.differentials)}
+        ${investigationBlock(data.investigations)}
+        ${empiricalTreatmentBlock(data.empirical_treatment)}
+        ${escalationBlock(data.escalation)}
+        ${redFlagsBlock(data.red_flags)}
+        ${disclaimerBlock(data.disclaimer)}
+      </div>
+    `
+  }
+
+  function safetyFlagsBlock(flags) {
+    if (!flags || !flags.length) return ""
+    const items = flags.map((f) => {
+      const isCritical = f.severity === "critical"
+      const icon = isCritical ? "⛔" : "⚠️"
+      const theme = isCritical
+        ? { border: "border-red-300", bg: "bg-red-50", title: "text-red-900", detail: "text-red-800", badge: "bg-red-100 text-red-800" }
+        : { border: "border-amber-300", bg: "bg-amber-50", title: "text-amber-900", detail: "text-amber-800", badge: "bg-amber-100 text-amber-800" }
+      return `
+        <div class="rounded-2xl border ${theme.border} ${theme.bg} p-4">
+          <div class="flex items-start gap-3">
+            <span class="text-lg leading-none mt-0.5">${icon}</span>
+            <div class="flex-1">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide ${theme.badge}">${escapeHtml(f.severity)}</span>
+                <p class="font-semibold ${theme.title}">${escapeHtml(f.issue || "")}</p>
+              </div>
+              <p class="text-sm ${theme.detail}">${escapeHtml(f.detail || "")}</p>
+            </div>
           </div>
-        `
-      }
+        </div>`
+    })
+    return `
+      <section class="space-y-3">
+        <div class="flex items-center gap-2">
+          <h3 class="text-base font-semibold uppercase tracking-wide text-red-700">Safety Review</h3>
+          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-red-100 text-red-700">${flags.length} issue${flags.length !== 1 ? "s" : ""}</span>
+        </div>
+        ${items.join("")}
+      </section>
+    `
+  }
+
+  function priorityActionsBlock(actions) {
+    if (!actions || !actions.length) return ""
+    return `
+      <section class="rounded-3xl border border-orange-200 p-5 bg-orange-50 shadow-sm space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xl font-semibold text-orange-900">Do This Now</h3>
+          <span class="inline-flex items-center px-3 py-1 rounded-full text-[11px] font-semibold bg-orange-100 text-orange-800">Priority</span>
+        </div>
+        <ol class="space-y-3 list-none">
+          ${actions.map((a, i) => `
+            <li class="flex items-start gap-3">
+              <span class="flex-shrink-0 w-6 h-6 rounded-full bg-orange-200 text-orange-900 text-xs font-bold flex items-center justify-center mt-0.5">${i + 1}</span>
+              <div>
+                <p class="font-semibold text-orange-900">${escapeHtml(a.action || "")}</p>
+                <p class="text-sm text-orange-700 mt-0.5">${escapeHtml(a.rationale || "")}</p>
+              </div>
+            </li>`).join("")}
+        </ol>
+      </section>
+    `
+  }
 
   function chiefComplaintBlock(chief) {
     if (!chief) return ""
@@ -490,6 +626,7 @@
 
   function historyBlock(history) {
     if (!history) return ""
+
     const questions = (history.questions || []).map(
       (q) => `
         <li class="mb-2">
@@ -499,14 +636,35 @@
         </li>`
     )
 
-    const exams = (history.examination || []).map(
-      (step) => `
-        <li class="mb-2">
-          <p class="font-semibold text-slate-900">${escapeHtml(step.step || "")}</p>
-          <p class="text-xs text-slate-500 uppercase tracking-wide">Why</p>
-          <p class="text-sm text-slate-600">${escapeHtml(step.rationale || "")}</p>
+    const precipitants = (history.precipitants || []).map((p) => {
+      const covered = p.covered === true
+      const badge = covered
+        ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-100 text-green-700 whitespace-nowrap">Explored</span>`
+        : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-700 whitespace-nowrap">Not explored</span>`
+      return `
+        <li class="flex items-start gap-2">
+          <div class="mt-0.5">${badge}</div>
+          <div>
+            <p class="font-semibold text-slate-900">${escapeHtml(p.factor || "")}</p>
+            ${!covered && p.suggested_question ? `<p class="text-sm text-slate-600 mt-0.5">${escapeHtml(p.suggested_question)}</p>` : ""}
+          </div>
         </li>`
-    )
+    })
+
+    const exams = (history.examination || []).map((step) => {
+      const done = step.status === "already_performed"
+      const badge = done
+        ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-100 text-green-700 whitespace-nowrap">Done</span>`
+        : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 whitespace-nowrap">Recommended</span>`
+      return `
+        <li class="flex items-start gap-2">
+          <div class="mt-0.5">${badge}</div>
+          <div>
+            <p class="font-semibold ${done ? "text-slate-400" : "text-slate-900"}">${escapeHtml(step.step || "")}</p>
+            <p class="text-sm text-slate-500 mt-0.5">${escapeHtml(step.rationale || "")}</p>
+          </div>
+        </li>`
+    })
 
     return `
       <section class="rounded-3xl border border-slate-200 p-5 bg-white shadow-sm space-y-5">
@@ -516,28 +674,36 @@
         </div>
         ${history.commentary ? `<p class="text-slate-600 leading-relaxed">${escapeHtml(history.commentary)}</p>` : ""}
         ${questions.length ? `<div class="rounded-2xl bg-slate-50 p-4 border border-slate-200"><p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">High-yield questions to add</p><ul class="space-y-3 text-slate-700">${questions.join("")}</ul></div>` : ""}
-        ${exams.length ? `<div class="rounded-2xl bg-slate-50 p-4 border border-slate-200"><p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">Physical examination priorities</p><ul class="space-y-3 text-slate-700">${exams.join("")}</ul></div>` : ""}
+        ${precipitants.length ? `<div class="rounded-2xl bg-slate-50 p-4 border border-slate-200"><p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">Precipitants — why now?</p><ul class="space-y-3 text-slate-700">${precipitants.join("")}</ul></div>` : ""}
+        ${exams.length ? `<div class="rounded-2xl bg-slate-50 p-4 border border-slate-200"><p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">Physical examination</p><ul class="space-y-3 text-slate-700">${exams.join("")}</ul></div>` : ""}
       </section>
     `
   }
 
   function differentialBlock(diff) {
     if (!diff) return ""
-    const bucket = (title, palette, items) => {
+
+    const bucket = (title, palette, items, showRiskScreen) => {
       if (!items || !items.length) return ""
       return `
         <div class="rounded-2xl border ${palette.border} ${palette.bg} p-4">
           <p class="text-xs font-semibold uppercase tracking-wide ${palette.text} mb-2">${title}</p>
-          <ul class="space-y-3">
-            ${items
-              .map(
-                (item) => `
-                  <li>
-                    <p class="font-semibold text-slate-900">${escapeHtml(item.diagnosis || "")}</p>
-                    <p class="text-sm text-slate-600">${escapeHtml(item.rationale || "")}</p>
-                  </li>`
-              )
-              .join("")}
+          <ul class="space-y-4">
+            ${items.map((item) => {
+              const rs = showRiskScreen && item.risk_screen
+              const asked = rs?.asked || []
+              const gaps = rs?.gaps || []
+              return `
+                <li>
+                  <p class="font-semibold text-slate-900">${escapeHtml(item.diagnosis || "")}</p>
+                  <p class="text-sm text-slate-600">${escapeHtml(item.rationale || "")}</p>
+                  ${rs && (asked.length || gaps.length) ? `
+                    <div class="mt-2 space-y-0.5">
+                      ${asked.length ? `<p class="text-xs text-green-700"><span class="font-semibold">Risk factors asked:</span> ${asked.map(escapeHtml).join(", ")}</p>` : ""}
+                      ${gaps.length ? `<p class="text-xs text-amber-700"><span class="font-semibold">Not asked:</span> ${gaps.map(escapeHtml).join(", ")}</p>` : ""}
+                    </div>` : ""}
+                </li>`
+            }).join("")}
           </ul>
         </div>
       `
@@ -550,9 +716,9 @@
           <span class="inline-flex items-center px-3 py-1 rounded-full text-[11px] font-semibold bg-rose-50 text-rose-600">DDx</span>
         </div>
         <div class="space-y-4">
-          ${bucket("Can't Miss", { border: "border-rose-100", bg: "bg-rose-50/70", text: "text-rose-600" }, diff.cant_miss)}
-          ${bucket("Common / Probable", { border: "border-emerald-100", bg: "bg-emerald-50/70", text: "text-emerald-600" }, diff.common)}
-          ${bucket("Other Considerations", { border: "border-slate-200", bg: "bg-slate-50", text: "text-slate-500" }, diff.other)}
+          ${bucket("Can't Miss", { border: "border-rose-100", bg: "bg-rose-50/70", text: "text-rose-600" }, diff.cant_miss, true)}
+          ${bucket("Common / Probable", { border: "border-emerald-100", bg: "bg-emerald-50/70", text: "text-emerald-600" }, diff.common, true)}
+          ${bucket("Other Considerations", { border: "border-slate-200", bg: "bg-slate-50", text: "text-slate-500" }, diff.other, false)}
         </div>
       </section>
     `
@@ -591,6 +757,53 @@
           ${block("Laboratory / Bloods", plan.laboratory)}
           ${block("Imaging", plan.imaging)}
         </div>
+      </section>
+    `
+  }
+
+  function empiricalTreatmentBlock(items) {
+    if (!items || !items.length) return ""
+    return `
+      <section class="rounded-3xl border border-violet-200 p-5 bg-violet-50 shadow-sm space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xl font-semibold text-violet-900">Empirical Treatment</h3>
+          <span class="inline-flex items-center px-3 py-1 rounded-full text-[11px] font-semibold bg-violet-100 text-violet-700">Treat to Test</span>
+        </div>
+        <ul class="space-y-4">
+          ${items.map((item) => `
+            <li>
+              <p class="font-semibold text-violet-900">${escapeHtml(item.diagnosis || "")}</p>
+              <p class="text-sm text-violet-800 mt-0.5"><span class="font-semibold">Treatment:</span> ${escapeHtml(item.treatment || "")}</p>
+              <p class="text-sm text-violet-700 mt-0.5"><span class="font-semibold">Expected response:</span> ${escapeHtml(item.expected_response || "")}</p>
+            </li>`).join("")}
+        </ul>
+      </section>
+    `
+  }
+
+  function escalationBlock(items) {
+    if (!items || !items.length) return ""
+    const urgencyTheme = (u) => {
+      if (u === "immediate") return "bg-red-100 text-red-800"
+      if (u === "urgent") return "bg-amber-100 text-amber-800"
+      return "bg-slate-100 text-slate-600"
+    }
+    return `
+      <section class="rounded-3xl border border-sky-200 p-5 bg-sky-50 shadow-sm space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xl font-semibold text-sky-900">Escalation Required</h3>
+          <span class="inline-flex items-center px-3 py-1 rounded-full text-[11px] font-semibold bg-sky-100 text-sky-700">Escalate</span>
+        </div>
+        <ul class="space-y-3">
+          ${items.map((item) => `
+            <li class="flex items-start gap-3">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold whitespace-nowrap mt-0.5 ${urgencyTheme(item.urgency)}">${escapeHtml(item.urgency || "")}</span>
+              <div>
+                <p class="font-semibold text-sky-900">${escapeHtml(item.team || "")}</p>
+                <p class="text-sm text-sky-700">${escapeHtml(item.trigger || "")}</p>
+              </div>
+            </li>`).join("")}
+        </ul>
       </section>
     `
   }
